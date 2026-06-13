@@ -1,0 +1,11 @@
+{
+  "name": "WaveSafe",
+  "author": "Ember Gábor",
+  "api_version": 1,
+  "flags": [],
+  "publish": {
+    "tags": ["music", "audio", "media", "background"],
+    "description": "Fully offline local-library music player. Background music while you game, controlled from the Steam Quick Access Menu: gapless playback, ReplayGain loudness normalization, and a drill-down library (Artists / Soundtracks / Favorites) with album art and favorites. No streaming, no accounts, no network.",
+    "image": "https://raw.githubusercontent.com/embergabor/wavesafe-deck-plugin/main/docs/screenshots/library.jpg"
+  }
+}

@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: |
+          pnpm run build
+          test -f dist/index.js || { echo "dist/index.js not produced"; exit 1; }
+
+      - name: Test (TS — genre logic)
+        run: pnpm run test:ts
+
+      - name: Test (Python unit suite)
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Sanity-check committed mpd binary
+        run: |
+          file bin/mpd | grep -q "statically linked" \
+            || { echo "bin/mpd is not a static binary"; exit 1; }
+
+      - name: Package plugin zip
+        run: ./scripts/package-plugin.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaveSafe
+          path: out/WaveSafe.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: out/WaveSafe.zip

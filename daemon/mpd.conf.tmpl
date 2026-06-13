@@ -1,0 +1,72 @@
+# WaveSafe Deck — MPD configuration template.
+#
+# Placeholders ({{...}}) are substituted by the backend (Decky main.py / Tauri
+# Rust) at first launch and written to ~/.config/wavesafe/mpd.conf. Tuned for the
+# in-game resource budget: low CPU/RAM, no background scanning, no extra servers.
+# See docs/PLAN.md → "Resource budget — in-game".
+
+# --- paths (all under /home/deck so they survive SteamOS immutable updates) ---
+music_directory     "{{MUSIC_DIR}}"          # e.g. /home/deck/Music/WaveSafe
+playlist_directory  "{{DATA_DIR}}/playlists"
+db_file             "{{DATA_DIR}}/database"
+state_file          "{{DATA_DIR}}/state"       # persists queue + playhead (session restore)
+state_file_interval "60"                        # auto-save after state changes too — queue
+                                                # survives hard power cuts, not just SIGTERM
+sticker_file        "{{DATA_DIR}}/sticker.sql" # favorites + custom Soundtrack tags
+pid_file            "{{DATA_DIR}}/mpd.pid"
+log_file            "{{DATA_DIR}}/mpd.log"
+
+# --- connections: a local unix socket (lean) + localhost TCP for clients ---
+bind_to_address     "{{SOCKET}}"               # e.g. /home/deck/.config/wavesafe/mpd.sock
+bind_to_address     "127.0.0.1"
+port                "6600"
+# Zero-polling clients (the QAM plugin) sit idle far longer than the 60s
+# default; clients also reconnect on demand — this just reduces churn.
+connection_timeout  "3600"
+
+# --- behavior ---
+auto_update         "no"                        # NO inotify watch while gaming; rescans are
+                                                # explicit (plugin start / Storage → Rescan).
+# music_directory is a WaveSafe-owned symlink farm pointing at READ-ONLY roots
+# (internal ~/Music + sd-*/Music on mounted cards) — links must be followed.
+follow_outside_symlinks "yes"
+follow_inside_symlinks  "yes"
+restore_paused      "yes"                        # restore paused, then resume on first play
+save_absolute_paths_in_playlists "no"
+zeroconf_enabled    "no"                          # no network advertisement
+
+# --- loudness normalization (WaveSafe's normalizeLoudness) ---
+# Default mode; the frontends flip this at runtime via the `replay_gain_mode`
+# command ("album" | "track" | "off"). `auto` = album when playing an album,
+# else track. `replaygain_limit` caps gain by track/album peak to prevent clipping.
+replaygain          "auto"
+replaygain_limit    "yes"
+volume_normalization "no"                         # we use ReplayGain, not the rolling normalizer
+
+# --- audio output (substituted by the renderer) ---
+# System/dev mpd → native `pipewire` output. Bundled STATIC musl mpd → `pipe`
+# output to the host's pw-cat (a musl binary can't dlopen glibc PipeWire libs;
+# the libc boundary becomes a process boundary). Both keep mixer_type
+# "software" ON PURPOSE: the QAM volume slider balances music against game
+# audio without touching the system volume (which moves the game too).
+{{AUDIO_OUTPUT}}
+
+# --- lean: no embedded HTTP server, no fifo/visualization outputs ---
+# (Those would add CPU/sockets for features we don't use in-game.)
+
+# Disable decoders we don't need. On SteamOS these two are also BROKEN when
+# pacman's mpd is newer than the frozen base system (fluidsynth pulls
+# libinstpatch which needs a newer glib2 → "symbol lookup error" at decoder
+# init/use). We play files, not MIDI — off, permanently.
+decoder {
+    plugin "fluidsynth"
+    enabled "no"
+}
+decoder {
+    plugin "wildmidi"
+    enabled "no"
+}
+
+# Note: `audio_buffer_size`/`buffer_before_play` were removed in MPD 0.23 — MPD
+# now sizes buffers automatically, so we intentionally do NOT set them (setting a
+# removed option logs a warning). Keep buffering to MPD's defaults.
