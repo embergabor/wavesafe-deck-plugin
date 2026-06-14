@@ -72,6 +72,19 @@ rescan; pop it back in and they return — favorites are remembered either way.
 > **Tip:** NTFS-formatted drives don't automount on SteamOS. Use exFAT or ext4
 > (the Deck's default SD format is fine).
 
+## Supported formats
+
+The bundled MPD decodes:
+
+- **FLAC** — `.flac`
+- **MP3** — `.mp3`
+- **Ogg Vorbis** — `.ogg`
+- **Opus** — `.opus`
+- **AAC** — `.m4a`, `.aac`
+- **WAV / AIFF** — `.wav`, `.aiff`
+
+Apple Lossless (**ALAC**) isn't supported yet.
+
 ## Develop
 
 A Python backend (`main.py`, module-level state) drives a bundled, committed
