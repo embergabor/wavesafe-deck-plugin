@@ -1,5 +1,7 @@
 # WaveSafe for Steam Deck
 
+![WaveSafe — offline music player](docs/banner.png)
+
 **Your music, playing in the background while you game — fully controllable from
 the Steam Quick Access Menu, without ever leaving your game.**
 
