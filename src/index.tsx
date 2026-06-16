@@ -10,7 +10,7 @@ import {
   SliderField,
   staticClasses,
 } from "@decky/ui";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FaBackward,
   FaForward,
@@ -88,6 +88,28 @@ function NowPlaying({ status, elapsed }: { status: PlayerStatus | null; elapsed:
     if (status?.volume != null) setVolumeLocal(status.volume);
   }, [status?.volume]);
 
+  // Seek scrubbing: SliderField fires onChange continuously while you drag, so
+  // seeking on every tick floods MPD and you hear it stutter through positions.
+  // Hold the value locally and commit exactly ONE seek: on pointer release for
+  // touch/mouse, or ~400ms after the last change for gamepad input (which has no
+  // release event). Audio keeps playing the current spot until a clean jump.
+  const [scrub, setScrub] = useState<number | null>(null);
+  const pendingSeek = useRef<number | null>(null);
+  const seekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const commitSeek = () => {
+    if (seekTimer.current) {
+      clearTimeout(seekTimer.current);
+      seekTimer.current = null;
+    }
+    const v = pendingSeek.current;
+    if (v == null) return;
+    pendingSeek.current = null;
+    void backend.seek(v).finally(() => setScrub(null));
+  };
+  useEffect(() => () => {
+    if (seekTimer.current) clearTimeout(seekTimer.current);
+  }, []);
+
   return (
     <PanelSection title="Now Playing">
       {/* Fixed-height track block: identical footprint whether nothing is
@@ -117,15 +139,22 @@ function NowPlaying({ status, elapsed }: { status: PlayerStatus | null; elapsed:
 
       {/* Always rendered (disabled when idle) so the panel height is stable. */}
       <PanelSectionRow>
-        <SliderField
-          value={duration > 0 ? Math.min(elapsed, duration) : 0}
-          min={0}
-          max={duration > 0 ? duration : 1}
-          step={1}
-          disabled={duration <= 0}
-          notchTicksVisible={false}
-          onChange={(v) => void backend.seek(v)}
-        />
+        <div style={{ width: "100%" }} onPointerUp={commitSeek}>
+          <SliderField
+            value={scrub ?? (duration > 0 ? Math.min(elapsed, duration) : 0)}
+            min={0}
+            max={duration > 0 ? duration : 1}
+            step={1}
+            disabled={duration <= 0}
+            notchTicksVisible={false}
+            onChange={(v) => {
+              setScrub(v);
+              pendingSeek.current = v;
+              if (seekTimer.current) clearTimeout(seekTimer.current);
+              seekTimer.current = setTimeout(commitSeek, 400);
+            }}
+          />
+        </div>
       </PanelSectionRow>
 
       <PanelSectionRow>

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import signal
 import sys
 from typing import Any, Optional
 
@@ -56,6 +57,7 @@ class _State:
         self.cmd: Optional[MPDClient] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.scan_task: Optional[asyncio.Task] = None
+        self.shutting_down = False  # set in _unload so the idle loop won't resurrect
         self.albums: dict[str, _AlbumEntry] = {}
         self.uri_to_album: dict[str, str] = {}
 
@@ -165,12 +167,17 @@ audio_output {
 
 # Pipe output — for the bundled STATIC musl mpd, which cannot dlopen the
 # host's glibc PipeWire client. Raw PCM goes to the host's pw-cat process.
+#
+# 32-bit FLOAT at the Deck's native 48 kHz: ReplayGain, the software volume
+# mixer, and the soxr resample all run in float, so nothing is quantized to an
+# integer until PipeWire converts to the device (with dither). 16-bit output
+# here truncated every gain/volume step and made high frequencies harsh.
 PIPE_OUTPUT = """\
 audio_output {
     type        "pipe"
     name        "WaveSafe PipeWire (pipe)"
-    command     "pw-cat -p --rate 48000 --channels 2 --format s16 -"
-    format      "48000:16:2"
+    command     "pw-cat -p --rate 48000 --channels 2 --format f32 -"
+    format      "48000:f:2"
     mixer_type  "software"
 }"""
 
@@ -275,6 +282,29 @@ async def _ensure_mpd_running() -> None:
     raise MPDError("MPD did not come up within 5s")
 
 
+async def _stop_mpd() -> None:
+    """Stop the bundled daemon when the plugin goes away (unload/uninstall) so
+    audio can't orphan with no UI left to stop it.
+
+    SIGTERM via the pid file is the reliable, NON-BLOCKING path (mpd saves its
+    state, then exits). We deliberately do NOT route MPD's `kill` command through
+    _cmd_run: `kill` drops the connection by design, which _cmd_run treats as a
+    dead socket and RETRIES by reconnecting to the dying daemon — that blocked
+    _unload past Decky's 5s SIGKILL timeout and orphaned mpd."""
+    try:
+        with open(os.path.join(S.data_dir, "mpd.pid")) as f:
+            os.kill(int(f.read().strip()), signal.SIGTERM)
+        return
+    except Exception:
+        pass
+    # Fallback only if the pid file is missing: a one-shot socket kill, no retry.
+    if S.cmd is not None and S.cmd.connected:
+        try:
+            await S.cmd.command("kill")
+        except Exception:
+            pass
+
+
 # ---- scan progress monitor ------------------------------------------------------
 async def _scan_progress_loop() -> None:
     """Report library-scan progress: while `updating_db` is in status, emit the
@@ -325,6 +355,11 @@ async def _idle_loop() -> None:
     except asyncio.CancelledError:
         raise
     except Exception as e:  # connection dropped (MPD restart) — back off & retry
+        # …UNLESS we're shutting down: stopping mpd drops this connection on
+        # purpose, and resurrecting here would reconnect-storm a dead daemon and
+        # hang _unload past Decky's 5s SIGKILL — which orphans mpd.
+        if S.shutting_down:
+            return
         decky.logger.warning("idle loop error: %s; retrying", e)
         await asyncio.sleep(1.0)
         if idle_conn is not None:
@@ -620,6 +655,7 @@ class Plugin:
         S.socket = os.path.join(S.config_dir, "mpd.sock")
         S.plugin_dir = getattr(decky, "DECKY_PLUGIN_DIR", _PLUGIN_DIR)
         S.lock = asyncio.Lock()
+        S.shutting_down = False
 
         _refresh_roots()
         await _ensure_mpd_running()
@@ -631,15 +667,30 @@ class Plugin:
         decky.logger.info("WaveSafe plugin started (MPD %s)", S.cmd.version)
 
     async def _unload(self):
+        # Set the flag BEFORE anything drops a connection, so the idle loop
+        # returns instead of resurrecting (a reconnect storm here hangs _unload
+        # past Decky's 5s SIGKILL — which is what orphaned mpd). Then cancel the
+        # tasks and stop the daemon. Keep this fast: no awaiting cancelled tasks.
+        S.shutting_down = True
         if S.idle_task is not None:
             S.idle_task.cancel()
+            S.idle_task = None
         if S.scan_task is not None:
             S.scan_task.cancel()
+            S.scan_task = None
+        await _stop_mpd()
         if S.cmd is not None:
-            await S.cmd.close()
-        decky.logger.info("WaveSafe plugin unloaded")
-        # NOTE: MPD is left running on purpose — audio continues across plugin
-        # reloads; a full stop is a Settings action, not an unload side effect.
+            try:
+                await S.cmd.close()
+            except Exception:
+                pass
+            S.cmd = None
+        decky.logger.info("WaveSafe plugin unloaded (MPD stopped)")
+
+    async def _uninstall(self):
+        # Removing the plugin removes the UI — make sure the daemon goes too.
+        await _stop_mpd()
+        decky.logger.info("WaveSafe plugin uninstalled (MPD stopped)")
 
     # transport
     async def status(self):
@@ -766,6 +817,7 @@ restore_paused "yes"
 zeroconf_enabled "no"
 replaygain "auto"
 replaygain_limit "yes"
+samplerate_converter "soxr very high"
 {{AUDIO_OUTPUT}}
 decoder {
     plugin "fluidsynth"

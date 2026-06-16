@@ -16,6 +16,8 @@
 #
 # Decoders: flac, mpg123 (mp3), vorbis, opus, faad (aac/m4a), sndfile
 # (wav/aiff). ALAC deferred (needs a static ffmpeg subset — follow-up).
+# Resampler: soxr (very high) — 44.1 kHz music → the Deck's 48 kHz output
+# without the harsh imaging of MPD's basic internal converter.
 set -euo pipefail
 
 OUT="${1:?usage: build-mpd-static.sh <outdir>}"
@@ -77,6 +79,11 @@ build_cmake "https://github.com/knik0/faad2/archive/refs/tags/2.11.1.tar.gz"
 build_autotools "https://github.com/libsndfile/libsndfile/releases/download/1.2.2/libsndfile-1.2.2.tar.xz" \
   --disable-external-libs --disable-mpeg --disable-full-suite
 build_cmake "https://codeberg.org/tenacityteam/libid3tag/archive/0.16.3.tar.gz"
+# libsoxr — high-quality resampler. No external deps; OpenMP off so there's no
+# openmp runtime to statically link. (If SourceForge is flaky, a GitHub soxr
+# mirror tarball works the same.) Installs soxr.pc → MPD's meson finds it.
+build_cmake "https://downloads.sourceforge.net/project/soxr/soxr-0.1.3-Source.tar.xz" \
+  -DWITH_OPENMP=OFF -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DWITH_LSR_BINDINGS=OFF
 
 curl -fsSL -o /tmp/mpd.tar.gz \
   "https://github.com/MusicPlayerDaemon/MPD/archive/refs/tags/v${MPD_VERSION}.tar.gz"
@@ -100,6 +107,7 @@ LDFLAGS="-static -s -L$PREFIX/lib" meson setup build \
   -Dfaad=enabled \
   -Dsndfile=enabled \
   -Did3tag=enabled \
+  -Dsoxr=enabled \
   -Dzlib=enabled \
   -Dpipe=true \
   -Dfifo=false \
@@ -121,3 +129,4 @@ du -h "$OUT/bin/mpd"
 "$OUT/bin/mpd" --version > /tmp/v.txt 2>&1 || true
 head -3 /tmp/v.txt
 grep -qi "flac" /tmp/v.txt || { echo "ERROR: flac decoder missing"; exit 1; }
+grep -qi "soxr" /tmp/v.txt || { echo "ERROR: soxr resampler missing"; exit 1; }

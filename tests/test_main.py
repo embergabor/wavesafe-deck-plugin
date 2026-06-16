@@ -285,6 +285,11 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn('type        "pipe"', conf)
         self.assertIn("pw-cat", conf)
         self.assertNotIn('"pipewire"', conf)
+        # Float PCM path (no 16-bit truncation of gain/volume) + soxr resampler.
+        self.assertIn("--format f32", conf)
+        self.assertIn('format      "48000:f:2"', conf)
+        self.assertNotIn("s16", conf)
+        self.assertIn('samplerate_converter "soxr very high"', conf)
 
     def test_system_binary_gets_pipewire_output(self):
         conf = self._render("/usr/bin/mpd")
@@ -313,6 +318,7 @@ class RenderConfigTests(unittest.TestCase):
             main._render_config(dest, "/usr/bin/mpd")
             conf = open(dest).read()
         self.assertIn("state_file_interval", conf)
+        self.assertIn('samplerate_converter "soxr very high"', conf)
         import re
         self.assertIsNone(re.search(r"\{\{[A-Z_]+\}\}", conf), "unsubstituted placeholder")
 
@@ -502,6 +508,18 @@ class IdleLoopTests(unittest.IsolatedAsyncioTestCase):
                 except asyncio.CancelledError:
                     pass
 
+    async def test_idle_loop_does_not_resurrect_when_shutting_down(self):
+        """Stopping mpd drops the idle connection on purpose; during shutdown the
+        loop must RETURN, not respawn itself (the resurrect-storm hung _unload
+        past Decky's 5s SIGKILL and orphaned mpd)."""
+        main.S = main._State()
+        main.S.socket = "/nonexistent/wsf.sock"      # forces host/port path
+        main.S.host, main.S.port = "127.0.0.1", 1     # connection refused → except branch
+        main.S.shutting_down = True
+        # Returns promptly (no 1s backoff, no new task) instead of looping.
+        await asyncio.wait_for(main._idle_loop(), timeout=2.0)
+        self.assertIsNone(main.S.idle_task)            # did NOT resurrect
+
 
 class ScanProgressTests(unittest.IsolatedAsyncioTestCase):
     """Scan-progress monitor: 1 Hz status/stats polling STRICTLY while
@@ -572,10 +590,60 @@ class ScanProgressTests(unittest.IsolatedAsyncioTestCase):
         async with FakeMPDServer(responses) as srv:
             p = await make_plugin(srv)
             main._start_scan_monitor()
+            task = main.S.scan_task
             await asyncio.sleep(0.05)  # let it start polling
             await p._unload()
-            with self.assertRaises(asyncio.CancelledError):
-                await main.S.scan_task
+            self.assertTrue(task.cancelled() or task.done())
+            self.assertIsNone(main.S.scan_task)
+
+
+class StopMpdTests(unittest.IsolatedAsyncioTestCase):
+    """The daemon must stop when the plugin goes away — otherwise music orphans
+    with no UI left to stop it (uninstall/disable). The stop must NOT route
+    `kill` through _cmd_run (its reconnect-retry chased the dying daemon and hung
+    _unload past Decky's 5s SIGKILL — the bug that orphaned mpd on hardware)."""
+
+    async def test_stop_via_pidfile_sigterm(self):
+        import tempfile
+
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            p = await make_plugin(srv)
+            with tempfile.TemporaryDirectory() as td:
+                main.S.data_dir = td
+                with open(os.path.join(td, "mpd.pid"), "w") as f:
+                    f.write("424242\n")
+                signalled = []
+                orig_kill = main.os.kill
+                main.os.kill = lambda pid, sig: signalled.append((pid, sig))
+                srv.received.clear()
+                try:
+                    await main._stop_mpd()
+                finally:
+                    main.os.kill = orig_kill
+            self.assertEqual(signalled, [(424242, main.signal.SIGTERM)])
+            self.assertNotIn("kill", srv.received)  # pid-file path → no socket kill
+
+    async def test_unload_stops_daemon_without_pidfile(self):
+        import tempfile
+
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            p = await make_plugin(srv)
+            with tempfile.TemporaryDirectory() as td:
+                main.S.data_dir = td  # empty → no pid file → socket-kill fallback
+                srv.received.clear()
+                await p._unload()
+            self.assertIn("kill", srv.received)
+
+    async def test_uninstall_stops_daemon(self):
+        import tempfile
+
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            p = await make_plugin(srv)
+            with tempfile.TemporaryDirectory() as td:
+                main.S.data_dir = td
+                srv.received.clear()
+                await p._uninstall()
+            self.assertIn("kill", srv.received)
 
 
 if __name__ == "__main__":

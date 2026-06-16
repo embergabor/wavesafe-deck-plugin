@@ -43,6 +43,12 @@ replaygain          "auto"
 replaygain_limit    "yes"
 volume_normalization "no"                         # we use ReplayGain, not the rolling normalizer
 
+# --- resampling ---
+# 44.1 kHz music → the Deck's native 48 kHz. soxr (very high) avoids the
+# imaging/aliasing of MPD's basic internal converter that made highs harsh.
+# Combined with the float output below, the whole DSP chain stays in float.
+samplerate_converter "soxr very high"
+
 # --- audio output (substituted by the renderer) ---
 # System/dev mpd → native `pipewire` output. Bundled STATIC musl mpd → `pipe`
 # output to the host's pw-cat (a musl binary can't dlopen glibc PipeWire libs;
