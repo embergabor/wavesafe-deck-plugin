@@ -1,6 +1,6 @@
 {
   "name": "wavesafe-deck-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WaveSafe — fully offline local-library music player for the Steam Deck, controlled in-game from the Quick Access Menu (Decky plugin).",
   "license": "MIT",
   "author": "Ember Gábor",
