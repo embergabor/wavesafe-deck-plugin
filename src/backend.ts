@@ -4,6 +4,9 @@ import { callable } from "@decky/api";
 import type { Album, PlayerStatus, ReplayGainMode } from "./core";
 
 export const PLAYER_EVENT = "wavesafe_player";
+/** Emitted only when the library (database) or favorites (stickers) change —
+ *  so browse lists refresh on real changes, not on every transport tick. */
+export const LIBRARY_EVENT = "wavesafe_library";
 /** Emitted ~1/sec while a library scan is running (and once when it ends). */
 export const SCAN_EVENT = "wavesafe_scan";
 export interface ScanProgress {

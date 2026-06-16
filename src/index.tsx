@@ -87,6 +87,14 @@ function NowPlaying({ status, elapsed }: { status: PlayerStatus | null; elapsed:
   useEffect(() => {
     if (status?.volume != null) setVolumeLocal(status.volume);
   }, [status?.volume]);
+  // Keep the thumb responsive locally but coalesce the setvol RPCs (dragging
+  // otherwise fires one per tick, flooding the single mpd socket).
+  const volTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const changeVolume = (v: number) => {
+    setVolumeLocal(v);
+    if (volTimer.current) clearTimeout(volTimer.current);
+    volTimer.current = setTimeout(() => void backend.setVolume(v), 120);
+  };
 
   // Seek scrubbing: SliderField fires onChange continuously while you drag, so
   // seeking on every tick floods MPD and you hear it stutter through positions.
@@ -108,6 +116,7 @@ function NowPlaying({ status, elapsed }: { status: PlayerStatus | null; elapsed:
   };
   useEffect(() => () => {
     if (seekTimer.current) clearTimeout(seekTimer.current);
+    if (volTimer.current) clearTimeout(volTimer.current);
   }, []);
 
   return (
@@ -193,10 +202,7 @@ function NowPlaying({ status, elapsed }: { status: PlayerStatus | null; elapsed:
             max={100}
             step={5}
             notchTicksVisible={false}
-            onChange={(v) => {
-              setVolumeLocal(v);
-              void backend.setVolume(v);
-            }}
+            onChange={changeVolume}
           />
         </PanelSectionRow>
       )}
@@ -244,26 +250,54 @@ function LevelHeader({ title, onBack }: { title: string; onBack: () => void }) {
 }
 
 // ---- album cover thumbnails ----------------------------------------------------
-// Full-size embedded art rendered at thumb size (no backend resize available):
-// fetches are serialized (one readpicture chain at a time on the MPD command
-// channel) and the cache is FIFO-capped to bound base64 memory in the webview.
+// The backend has no resize (no PIL), so it returns full-size embedded art. We
+// downscale it to a small thumbnail in the webview and cache ONLY that — a
+// FIFO-capped set of tiny JPEGs instead of dozens of multi-MB base64 blobs.
+// Fetches are serialized (one readpicture chain at a time on the MPD channel).
 const COVER_CACHE_MAX = 60;
+const COVER_THUMB_PX = 64;
 const coverCache = new Map<string, string | null>();
 const coverInflight = new Map<string, Promise<string | null>>();
 let coverQueue: Promise<unknown> = Promise.resolve();
+
+/** Draw a (large) data URL onto a small canvas and re-export it tiny. Always
+ *  resolves — falls back to the original on any failure. */
+function downscaleCover(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = COVER_THUMB_PX;
+        canvas.height = COVER_THUMB_PX;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return resolve(dataUrl);
+        ctx.drawImage(img, 0, 0, COVER_THUMB_PX, COVER_THUMB_PX);
+        resolve(canvas.toDataURL("image/jpeg", 0.82));
+      } catch {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
 
 function fetchCover(albumKey: string): Promise<string | null> {
   if (coverCache.has(albumKey)) return Promise.resolve(coverCache.get(albumKey) ?? null);
   let p = coverInflight.get(albumKey);
   if (!p) {
     p = (coverQueue = coverQueue.then(() => backend.albumCover(albumKey)).catch(() => null)).then(
-      (url) => {
+      async (url) => {
         coverInflight.delete(albumKey);
+        // Downscale to a thumbnail and cache only that; the full-size blob is
+        // dropped here, so the cache holds tiny images, not multi-MB originals.
+        const thumb = typeof url === "string" && url ? await downscaleCover(url) : null;
         if (coverCache.size >= COVER_CACHE_MAX) {
           coverCache.delete(coverCache.keys().next().value!);
         }
-        coverCache.set(albumKey, (url as string | null) ?? null);
-        return (url as string | null) ?? null;
+        coverCache.set(albumKey, thumb);
+        return thumb;
       },
     );
     coverInflight.set(albumKey, p);
@@ -564,9 +598,11 @@ function BrowseImpl({
       backend.recentAlbums(8).then(setRecent).catch(() => {});
     };
     refresh();
+    // Refresh the lists ONLY when the library or favorites actually change —
+    // not on every play/pause/seek/volume tick (which would fire 3 RPCs each).
     const onEvent = () => refresh();
-    addEventListener(backend.PLAYER_EVENT, onEvent);
-    return () => removeEventListener(backend.PLAYER_EVENT, onEvent);
+    addEventListener(backend.LIBRARY_EVENT, onEvent);
+    return () => removeEventListener(backend.LIBRARY_EVENT, onEvent);
   }, []);
 
   const artists = useMemo(() => {
@@ -671,9 +707,30 @@ function BrowseImpl({
   );
 }
 
-export default definePlugin(() => ({
-  name: "WaveSafe",
-  titleView: <div className={staticClasses.Title}>WaveSafe</div>,
-  content: <Content />,
-  icon: <FaMusic />,
-}));
+export default definePlugin(() => {
+  // Pause playback when the Deck suspends, and do NOT register a resume handler
+  // (so music stays paused on wake — restore_paused keeps it paused even if mpd
+  // restarts). Registered at plugin scope so it persists while the QAM is closed.
+  // SteamClient.System is an undocumented internal API Valve has removed/restored
+  // before, so guard it and unregister on dismount.
+  let suspendSub: { unregister: () => void } | undefined;
+  try {
+    const sc = (window as unknown as { SteamClient?: any }).SteamClient;
+    suspendSub = sc?.System?.RegisterForOnSuspendRequest?.(() => void backend.pause());
+  } catch {
+    /* API unavailable on this Steam build — skip */
+  }
+  return {
+    name: "WaveSafe",
+    titleView: <div className={staticClasses.Title}>WaveSafe</div>,
+    content: <Content />,
+    icon: <FaMusic />,
+    onDismount() {
+      try {
+        suspendSub?.unregister();
+      } catch {
+        /* noop */
+      }
+    },
+  };
+});

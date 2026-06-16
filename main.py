@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import signal
 import sys
+import time
 from typing import Any, Optional
 
 import decky  # provided by Decky Loader at runtime
@@ -37,6 +39,7 @@ from mpd_client import MPDClient, MPDError, mpd_quote  # noqa: E402
 
 FAV_STICKER = "wavesafe_fav"
 PLAYER_EVENT = "wavesafe_player"
+LIBRARY_EVENT = "wavesafe_library"  # database/sticker changes only (browse lists)
 SCAN_EVENT = "wavesafe_scan"
 SCAN_POLL_SEC = 1.0  # scan-progress poll interval (tests shrink it)
 
@@ -58,6 +61,7 @@ class _State:
         self.idle_task: Optional[asyncio.Task] = None
         self.scan_task: Optional[asyncio.Task] = None
         self.shutting_down = False  # set in _unload so the idle loop won't resurrect
+        self.respawns: list[float] = []  # monotonic times of recent mpd respawns
         self.albums: dict[str, _AlbumEntry] = {}
         self.uri_to_album: dict[str, str] = {}
 
@@ -124,6 +128,26 @@ class _AlbumEntry:
             "year": self.year,
             "genre": self.genre,
         }
+
+    def to_cache(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "title": self.title,
+            "album_artist": self.album_artist,
+            "genre": self.genre,
+            "year": self.year,
+            "uris": self.uris,
+            "last_modified": self.last_modified,
+        }
+
+    @staticmethod
+    def from_cache(d: dict[str, Any]) -> "_AlbumEntry":
+        e = _AlbumEntry(d["key"], d["title"], d["album_artist"])
+        e.genre = d.get("genre")
+        e.year = d.get("year")
+        e.uris = list(d.get("uris") or [])
+        e.last_modified = d.get("last_modified", "")
+        return e
 
 
 S = _State()
@@ -258,7 +282,9 @@ async def _ensure_mpd_running() -> None:
     # XDG_RUNTIME_DIR to find /run/user/<uid>/pipewire-0 ("Host is down" without).
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
     spawn_log = os.path.join(S.data_dir, "mpd-spawn.log")
-    with open(spawn_log, "ab") as errf:
+    # Truncate (not append): keep only the latest spawn's stderr — this fires on
+    # every (re)spawn, so appending would grow unbounded.
+    with open(spawn_log, "wb") as errf:
         proc = await asyncio.create_subprocess_exec(
             mpd_bin,
             conf_path,
@@ -303,6 +329,38 @@ async def _stop_mpd() -> None:
             await S.cmd.command("kill")
         except Exception:
             pass
+
+
+# ---- crash watchdog ----------------------------------------------------------
+_RESPAWN_MAX = 3       # at most this many respawns…
+_RESPAWN_WINDOW = 60.0  # …within this many seconds, else give up (crash loop)
+
+
+def _mpd_alive() -> bool:
+    """Is the mpd process from the pid file still running?"""
+    try:
+        with open(os.path.join(S.data_dir, "mpd.pid")) as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours to signal
+    except Exception:
+        return False
+
+
+def _respawn_allowed() -> bool:
+    """Record a respawn attempt and report whether we're still under the cap
+    (so a daemon that crashes on every start can't spin forever)."""
+    now = time.monotonic()
+    S.respawns = [t for t in S.respawns if now - t < _RESPAWN_WINDOW]
+    S.respawns.append(now)
+    return len(S.respawns) <= _RESPAWN_MAX
 
 
 # ---- scan progress monitor ------------------------------------------------------
@@ -350,6 +408,10 @@ async def _idle_loop() -> None:
             if "update" in changed:
                 # A scan started (or ended — the monitor's final emit covers that).
                 _start_scan_monitor()
+            # Browse lists only care about library/favorites changes — emit a
+            # separate lightweight event so they don't refetch on every tick.
+            if "database" in changed or "sticker" in changed:
+                await decky.emit(LIBRARY_EVENT, None)
             status = await _status()
             await decky.emit(PLAYER_EVENT, status)
     except asyncio.CancelledError:
@@ -360,10 +422,28 @@ async def _idle_loop() -> None:
         # hang _unload past Decky's 5s SIGKILL — which orphans mpd.
         if S.shutting_down:
             return
-        decky.logger.warning("idle loop error: %s; retrying", e)
-        await asyncio.sleep(1.0)
         if idle_conn is not None:
-            await idle_conn.close()
+            try:
+                await idle_conn.close()
+            except Exception:
+                pass
+        if not _mpd_alive():
+            # The daemon actually died — respawn it (bounded) instead of
+            # reconnect-storming a dead socket forever.
+            if not _respawn_allowed():
+                decky.logger.error("mpd keeps dying; respawn cap hit — giving up")
+                return
+            decky.logger.warning("mpd is not running; respawning")
+            try:
+                await _ensure_mpd_running()
+                S.cmd = None  # force a fresh command connection too
+                await _build_index()
+            except Exception as e2:
+                decky.logger.warning("mpd respawn failed: %s; will retry", e2)
+                await asyncio.sleep(2.0)
+        else:
+            decky.logger.warning("idle loop error: %s; reconnecting", e)
+            await asyncio.sleep(1.0)
         S.idle_task = asyncio.create_task(_idle_loop())
     finally:
         if idle_conn is not None and idle_conn.connected:
@@ -454,6 +534,66 @@ async def _build_index() -> None:
             uri_to_album[entry.uris[0]] = entry.key
     S.albums = albums
     S.uri_to_album = uri_to_album
+    # Persist for fast startup; next load skips listallinfo if the DB is unchanged.
+    try:
+        _write_index_cache(await _library_fingerprint())
+    except Exception as e:
+        decky.logger.warning("index cache write failed: %s", e)
+
+
+# ---- index disk cache (skip the full listallinfo when the library is unchanged) -
+_INDEX_CACHE_VERSION = 1
+
+
+def _index_cache_path() -> str:
+    return os.path.join(S.data_dir, "album-index.json")
+
+
+async def _library_fingerprint() -> dict[str, str]:
+    """A cheap signature of the library state from MPD `stats`: when both the
+    last DB-update timestamp and the song count match, the index is current."""
+    st = MPDClient.as_dict(await _cmd_run("stats"))
+    return {"db_update": st.get("db_update", ""), "songs": st.get("songs", "")}
+
+
+def _write_index_cache(fingerprint: dict[str, str]) -> None:
+    if not S.data_dir:
+        return
+    data = {
+        "v": _INDEX_CACHE_VERSION,
+        "fingerprint": fingerprint,
+        "albums": [e.to_cache() for e in S.albums.values()],
+    }
+    path = _index_cache_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)  # atomic
+
+
+def _load_index_cache(fingerprint: dict[str, str]) -> bool:
+    """Load S.albums/S.uri_to_album from disk iff the cache matches `fingerprint`
+    and the schema version. Returns True on a cache hit."""
+    try:
+        with open(_index_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if data.get("v") != _INDEX_CACHE_VERSION or data.get("fingerprint") != fingerprint:
+        return False
+    albums: dict[str, _AlbumEntry] = {}
+    uri_to_album: dict[str, str] = {}
+    try:
+        for d in data.get("albums", []):
+            e = _AlbumEntry.from_cache(d)
+            albums[e.key] = e
+            if e.uris:
+                uri_to_album[e.uris[0]] = e.key
+    except Exception:
+        return False
+    S.albums = albums
+    S.uri_to_album = uri_to_album
+    return True
 
 
 # ---- transport -----------------------------------------------------------------
@@ -662,7 +802,16 @@ class Plugin:
         S.cmd = await _connect()
         await _migrate_music_dir_if_needed()
         await _cmd_run("update")  # cheap when unchanged; picks up SD changes
-        await _build_index()
+        # Fast path: reuse the cached index if the library is unchanged; otherwise
+        # do the full listallinfo. A scan kicked off above lands as a `database`
+        # idle event, which rebuilds + refreshes the cache.
+        try:
+            if _load_index_cache(await _library_fingerprint()):
+                decky.logger.info("album index: cache hit (%d albums)", len(S.albums))
+            else:
+                await _build_index()
+        except Exception:
+            await _build_index()
         S.idle_task = asyncio.create_task(_idle_loop())
         decky.logger.info("WaveSafe plugin started (MPD %s)", S.cmd.version)
 

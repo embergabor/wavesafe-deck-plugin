@@ -471,6 +471,8 @@ class IdleLoopTests(unittest.IsolatedAsyncioTestCase):
                 event, args = decky.emitted[0]
                 self.assertEqual(event, main.PLAYER_EVENT)
                 self.assertEqual(args[0]["state"], "play")
+                # A `player` change must NOT trigger the library event.
+                self.assertNotIn(main.LIBRARY_EVENT, [e for e, _ in decky.emitted])
             finally:
                 task.cancel()
                 try:
@@ -519,6 +521,96 @@ class IdleLoopTests(unittest.IsolatedAsyncioTestCase):
         # Returns promptly (no 1s backoff, no new task) instead of looping.
         await asyncio.wait_for(main._idle_loop(), timeout=2.0)
         self.assertIsNone(main.S.idle_task)            # did NOT resurrect
+
+    async def test_sticker_change_emits_library_event(self):
+        responses = {
+            "listallinfo": LISTALLINFO,
+            "status": STATUS,
+            "currentsong": CURRENTSONG,
+            "replay_gain_status": RG_STATUS,
+            IDLE_CMD: b"changed: sticker\nOK\n",
+        }
+        async with FakeMPDServer(responses) as srv:
+            p = await make_plugin(srv)
+            decky.emitted.clear()
+            task = asyncio.create_task(main._idle_loop())
+            try:
+                for _ in range(50):
+                    if any(e == main.LIBRARY_EVENT for e, _ in decky.emitted):
+                        break
+                    await asyncio.sleep(0.02)
+                events = [e for e, _ in decky.emitted]
+                self.assertIn(main.LIBRARY_EVENT, events)  # favorites changed
+                self.assertIn(main.PLAYER_EVENT, events)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+class IndexCacheTests(unittest.IsolatedAsyncioTestCase):
+    """Album index disk cache: skip listallinfo when the library fingerprint
+    (db_update + songs) is unchanged."""
+
+    async def test_cache_roundtrip_and_fingerprint(self):
+        import tempfile
+
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            p = await make_plugin(srv)
+            with tempfile.TemporaryDirectory() as td:
+                main.S.data_dir = td
+                fp = {"db_update": "1700000000", "songs": "3"}
+                main._write_index_cache(fp)
+                # Wipe in-memory state, then a matching fingerprint restores it.
+                saved_keys = set(main.S.albums)
+                main.S.albums, main.S.uri_to_album = {}, {}
+                self.assertTrue(main._load_index_cache(fp))
+                self.assertEqual(set(main.S.albums), saved_keys)
+                self.assertEqual(
+                    main.S.uri_to_album["rock/abbey/1.flac"], "thebeatles::abbeyroad"
+                )
+                # A changed fingerprint is a miss (forces a rebuild upstream).
+                self.assertFalse(main._load_index_cache({"db_update": "2", "songs": "3"}))
+                # A bumped schema version is also a miss.
+                main._INDEX_CACHE_VERSION += 1
+                try:
+                    self.assertFalse(main._load_index_cache(fp))
+                finally:
+                    main._INDEX_CACHE_VERSION -= 1
+
+
+class WatchdogTests(unittest.IsolatedAsyncioTestCase):
+    """mpd-crash watchdog decision helpers."""
+
+    async def test_mpd_alive_via_pidfile(self):
+        import tempfile
+
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            await make_plugin(srv)
+            with tempfile.TemporaryDirectory() as td:
+                main.S.data_dir = td
+                # Our own pid is alive.
+                with open(os.path.join(td, "mpd.pid"), "w") as f:
+                    f.write(f"{os.getpid()}\n")
+                self.assertTrue(main._mpd_alive())
+                # A pid that doesn't exist reads as dead.
+                with open(os.path.join(td, "mpd.pid"), "w") as f:
+                    f.write("2147483600\n")
+                self.assertFalse(main._mpd_alive())
+                # No pid file → dead.
+                os.remove(os.path.join(td, "mpd.pid"))
+                self.assertFalse(main._mpd_alive())
+
+    async def test_respawn_backoff_cap(self):
+        async with FakeMPDServer({"listallinfo": LISTALLINFO}) as srv:
+            await make_plugin(srv)
+            main.S.respawns = []
+            # Up to the cap is allowed; the next one is denied (crash-loop guard).
+            allowed = [main._respawn_allowed() for _ in range(main._RESPAWN_MAX)]
+            self.assertTrue(all(allowed))
+            self.assertFalse(main._respawn_allowed())
 
 
 class ScanProgressTests(unittest.IsolatedAsyncioTestCase):
