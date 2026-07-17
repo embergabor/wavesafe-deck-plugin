@@ -286,6 +286,9 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn("pw-cat", conf)
         self.assertNotIn('"pipewire"', conf)
         # Float PCM path (no 16-bit truncation of gain/volume) + soxr resampler.
+        # --raw is required: pw-cat >= 1.6 sniffs stdin as a sound FILE without
+        # it and rejects headerless PCM ("Format not recognised").
+        self.assertIn("--raw", conf)
         self.assertIn("--format f32", conf)
         self.assertIn('format      "48000:f:2"', conf)
         self.assertNotIn("s16", conf)

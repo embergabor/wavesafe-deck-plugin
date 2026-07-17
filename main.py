@@ -196,11 +196,15 @@ audio_output {
 # mixer, and the soxr resample all run in float, so nothing is quantized to an
 # integer until PipeWire converts to the device (with dither). 16-bit output
 # here truncated every gain/volume step and made high frequencies harsh.
+#
+# --raw is mandatory: pw-cat >= 1.6 (SteamOS 3.7+) otherwise sniffs stdin as a
+# sound FILE via libsndfile and rejects headerless PCM ("Format not
+# recognised" → broken pipe → "Failed to open audio output" on every play).
 PIPE_OUTPUT = """\
 audio_output {
     type        "pipe"
     name        "WaveSafe PipeWire (pipe)"
-    command     "pw-cat -p --rate 48000 --channels 2 --format f32 -"
+    command     "pw-cat -p --raw --rate 48000 --channels 2 --format f32 -"
     format      "48000:f:2"
     mixer_type  "software"
 }"""
