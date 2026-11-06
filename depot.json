@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "WaveSafe",
+  "device": "steam-deck",
+  "method": "decky-plugin",
+  "asset": "WaveSafe.zip",
+  "plugin": "WaveSafe"
+}
